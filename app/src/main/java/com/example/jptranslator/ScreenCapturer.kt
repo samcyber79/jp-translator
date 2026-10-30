@@ -70,16 +70,26 @@ class ScreenCapturer(
         reader?.close(); reader = null
     }
 
-    /** 새 프레임이 들어왔으면 그 프레임의 축소 지문(signature)을, 아니면 null */
-    fun signatureIfNew(): Signature? {
+    /**
+     * 새 프레임이 들어왔으면 그 프레임의 축소 지문(signature)을, 아니면 null.
+     * [area]를 주면 그 영역만 [cols]칸 격자로 촘촘하게 본다 (영역 모드).
+     */
+    fun signatureIfNew(area: Rect? = null, cols: Int = Signature.COLS): Signature? {
         if (!dirty) return null
         dirty = false
         val img = latest ?: return null
-        return computeSignature(img)
+        return computeSignature(img, area, cols)
     }
 
-    /** 가장 최근 프레임을 Bitmap으로 복사 */
-    fun latestBitmap(): Bitmap? {
+    /** 새 프레임 여부와 상관없이 최신 프레임의 지문 */
+    fun signatureNow(area: Rect? = null, cols: Int = Signature.COLS): Signature? {
+        dirty = false
+        val img = latest ?: return null
+        return computeSignature(img, area, cols)
+    }
+
+    /** 가장 최근 프레임을 Bitmap으로 복사. [crop]을 주면 그 부분만 */
+    fun latestBitmap(crop: Rect? = null): Bitmap? {
         val img = latest ?: return null
         val plane = img.planes[0]
         val buf = plane.buffer
@@ -89,10 +99,17 @@ class ScreenCapturer(
         val full = Bitmap.createBitmap(img.width + rowPadding / pixelStride, img.height, Bitmap.Config.ARGB_8888)
         buf.rewind()
         full.copyPixelsFromBuffer(buf)
-        if (rowPadding == 0) return full
-        val cropped = Bitmap.createBitmap(full, 0, 0, img.width, img.height)
+        val c = if (crop != null) clampTo(crop, img.width, img.height) ?: return null.also { full.recycle() }
+        else Rect(0, 0, img.width, img.height)
+        if (c.left == 0 && c.top == 0 && c.width() == full.width && c.height() == full.height) return full
+        val cropped = Bitmap.createBitmap(full, c.left, c.top, c.width(), c.height())
         full.recycle()
         return cropped
+    }
+
+    private fun clampTo(r: Rect, w: Int, h: Int): Rect? {
+        val c = Rect(r.left.coerceIn(0, w), r.top.coerceIn(0, h), r.right.coerceIn(0, w), r.bottom.coerceIn(0, h))
+        return if (c.width() < 4 || c.height() < 4) null else c
     }
 
     // ---------------------------------------------------------------------
@@ -121,16 +138,19 @@ class ScreenCapturer(
         return Triple(b.width(), b.height(), dpi)
     }
 
-    /** 화면을 COLS x rows 격자로 나눠 각 칸의 평균 밝기를 구한다 (변화 감지용). */
-    private fun computeSignature(img: Image): Signature {
+    /**
+     * 화면(또는 [area])을 cols x rows 격자로 나눠 각 칸의 평균 밝기를 구한다 (변화 감지용).
+     * 칸이 정사각형에 가깝게 rows를 정한다.
+     */
+    private fun computeSignature(img: Image, area: Rect?, cols: Int): Signature {
         val plane = img.planes[0]
         val buf = plane.buffer
         val ps = plane.pixelStride
         val rs = plane.rowStride
-        val w = img.width
-        val h = img.height
-        val cols = Signature.COLS
-        val rows = (cols * h / w.toFloat()).toInt().coerceAtLeast(1)
+        val a = area?.let { clampTo(it, img.width, img.height) } ?: Rect(0, 0, img.width, img.height)
+        val w = a.width()
+        val h = a.height()
+        val rows = (cols * h / w.toFloat()).toInt().coerceIn(1, 64)
         val cellW = w / cols.toFloat()
         val cellH = h / rows.toFloat()
         val values = IntArray(cols * rows)
@@ -139,9 +159,9 @@ class ScreenCapturer(
             for (c in 0 until cols) {
                 var sum = 0
                 for (sy in 0 until n) {
-                    val y = (r * cellH + (sy + 0.5f) * cellH / n).toInt().coerceIn(0, h - 1)
+                    val y = a.top + (r * cellH + (sy + 0.5f) * cellH / n).toInt().coerceIn(0, h - 1)
                     for (sx in 0 until n) {
-                        val x = (c * cellW + (sx + 0.5f) * cellW / n).toInt().coerceIn(0, w - 1)
+                        val x = a.left + (c * cellW + (sx + 0.5f) * cellW / n).toInt().coerceIn(0, w - 1)
                         val i = y * rs + x * ps
                         val red = buf.get(i).toInt() and 0xFF
                         val green = buf.get(i + 1).toInt() and 0xFF
@@ -152,33 +172,44 @@ class ScreenCapturer(
                 values[r * cols + c] = sum / (n * n)
             }
         }
-        return Signature(w, h, rows, values)
+        return Signature(Rect(a), cols, rows, values)
     }
 
     /** 축소된 화면 밝기 격자 */
-    class Signature(val width: Int, val height: Int, val rows: Int, val values: IntArray) {
+    class Signature(val area: Rect, val cols: Int, val rows: Int, val values: IntArray) {
 
-        /** 두 프레임이 의미 있게 달라졌는지. [mask] 영역(플로팅 버튼 등)은 무시 */
-        fun differsFrom(other: Signature, mask: Rect?): Boolean {
-            if (other.width != width || other.height != height || other.values.size != values.size) return true
-            val cellW = width / COLS.toFloat()
-            val cellH = height / rows.toFloat()
+        /**
+         * 두 프레임이 의미 있게 달라졌는지. [mask] 영역(플로팅 버튼 등)은 무시.
+         * @param cellThreshold 한 칸의 밝기 차이가 이보다 커야 "바뀐 칸"
+         * @param minChanged 바뀐 칸이 이 개수 이상이어야 "화면이 바뀜"
+         */
+        fun differsFrom(
+            other: Signature,
+            mask: Rect?,
+            cellThreshold: Int = CELL_THRESHOLD,
+            minChanged: Int = maxOf(4, values.size / 300 + 1),
+        ): Boolean {
+            if (other.area != area || other.cols != cols || other.rows != rows) return true
+            val cellW = area.width() / cols.toFloat()
+            val cellH = area.height() / rows.toFloat()
             var changed = 0
             for (r in 0 until rows) {
-                for (c in 0 until COLS) {
+                for (c in 0 until cols) {
                     if (mask != null) {
-                        val cx = ((c + 0.5f) * cellW).toInt()
-                        val cy = ((r + 0.5f) * cellH).toInt()
+                        val cx = area.left + ((c + 0.5f) * cellW).toInt()
+                        val cy = area.top + ((r + 0.5f) * cellH).toInt()
                         if (cx >= mask.left - cellW && cx <= mask.right + cellW &&
                             cy >= mask.top - cellH && cy <= mask.bottom + cellH
                         ) continue
                     }
-                    val i = r * COLS + c
-                    if (abs(values[i] - other.values[i]) > CELL_THRESHOLD) changed++
+                    val i = r * cols + c
+                    if (abs(values[i] - other.values[i]) > cellThreshold) {
+                        changed++
+                        if (changed >= minChanged) return true
+                    }
                 }
             }
-            // 커서 깜빡임 같은 아주 작은 변화는 무시
-            return changed > maxOf(3, values.size / 300)
+            return false
         }
 
         companion object {

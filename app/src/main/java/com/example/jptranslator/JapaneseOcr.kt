@@ -55,6 +55,25 @@ class JapaneseOcr {
         }
     }
 
+    /**
+     * 영역 모드용: 잘라낸 영역 이미지를 인식하고 블록을 읽는 순서로 정렬해서 돌려준다.
+     * 작은 글씨는 인식률이 떨어지므로 영역이 작으면 확대해서 인식한다.
+     */
+    suspend fun recognizeRegion(crop: Bitmap): List<OcrBlock> {
+        val scale = when {
+            crop.height < 160 -> 2.0f
+            crop.height < 320 && crop.width < 900 -> 1.5f
+            else -> 1.0f
+        }
+        val input = if (scale > 1f) Bitmap.createScaledBitmap(
+            crop, (crop.width * scale).toInt(), (crop.height * scale).toInt(), true,
+        ) else crop
+        val blocks = try { recognize(input) } finally { if (input !== crop) input.recycle() }
+        val verticalCount = blocks.count { it.vertical }
+        return if (verticalCount * 2 > blocks.size) blocks.sortedByDescending { it.rect.right }
+        else blocks.sortedWith(compareBy({ it.rect.top / 24 }, { it.rect.left }))
+    }
+
     fun close() = recognizer.close()
 
     // ---------------------------------------------------------------------

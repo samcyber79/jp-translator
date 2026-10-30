@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.Rect
 import android.graphics.RectF
 import android.text.Layout
 import android.text.StaticLayout
@@ -47,8 +48,24 @@ class TranslationOverlayView(context: Context) : View(context) {
 
     fun clear() = setItems(emptyList())
 
+    // ---------------------------------------------------------------- 영역 모드 상태
+
+    private var region: Rect? = null
+    private var panelLines: List<Pair<String, String>> = emptyList()   // (원문, 번역)
+    private var showOriginal = false
+    private var panelPos = 0          // 0 자동, 1 위, 2 아래
+
+    /** 영역 모드: 영역 테두리 + 영역 밖 번역창. region=null 이면 영역 모드 표시를 끈다 */
+    fun setRegionPanel(region: Rect?, lines: List<Pair<String, String>>, showOriginal: Boolean, panelPos: Int) {
+        this.region = region?.let { Rect(it) }
+        this.panelLines = lines
+        this.showOriginal = showOriginal
+        this.panelPos = panelPos
+        invalidate()
+    }
+
     override fun onDraw(canvas: Canvas) {
-        if (items.isEmpty()) return
+        if (items.isEmpty() && region == null) return
         // 결과 좌표는 화면 절대좌표 → 이 뷰의 좌표로 변환
         getLocationOnScreen(loc)
         canvas.save()
@@ -59,7 +76,93 @@ class TranslationOverlayView(context: Context) : View(context) {
             if (item.vertical && verticalRender) drawVertical(canvas, item, screenW, screenH)
             else drawHorizontal(canvas, item, screenW, screenH)
         }
+        region?.let { drawRegion(canvas, it, screenW, screenH) }
         canvas.restore()
+    }
+
+    // ---------------------------------------------------------------- 영역 모드 그리기
+
+    private val framePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = dp(3f)
+        strokeCap = Paint.Cap.ROUND
+        color = Color.argb(230, 255, 196, 0)
+    }
+    private val panelBg = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.argb(240, 22, 22, 26) }
+    private val panelText = TextPaint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE }
+
+    private fun drawRegion(canvas: Canvas, r: Rect, screenW: Float, screenH: Float) {
+        // 테두리는 영역 "바깥"에 모서리만 그린다 → 캡처한 영역 안에 섞여 들어가지 않음
+        val o = dp(5f)
+        val len = min(dp(22f), min(r.width(), r.height()) / 3f)
+        val l = r.left - o
+        val t = r.top - o
+        val rr = r.right + o
+        val b = r.bottom + o
+        canvas.drawLine(l, t, l + len, t, framePaint); canvas.drawLine(l, t, l, t + len, framePaint)
+        canvas.drawLine(rr, t, rr - len, t, framePaint); canvas.drawLine(rr, t, rr, t + len, framePaint)
+        canvas.drawLine(l, b, l + len, b, framePaint); canvas.drawLine(l, b, l, b - len, framePaint)
+        canvas.drawLine(rr, b, rr - len, b, framePaint); canvas.drawLine(rr, b, rr, b - len, framePaint)
+
+        if (panelLines.isEmpty()) return
+
+        val pad = dp(10f)
+        val gap = dp(10f)
+        val panelW = r.width().toFloat().coerceIn(min(dp(260f), screenW - dp(16f)), screenW - dp(16f))
+        val innerW = (panelW - pad * 2).toInt()
+        val spaceBelow = screenH - (r.bottom + gap)
+        val spaceAbove = r.top - gap
+        val maxH = when (panelPos) {
+            1 -> spaceAbove
+            2 -> spaceBelow
+            else -> max(spaceAbove, spaceBelow)
+        }.coerceAtLeast(dp(60f))
+
+        // 공간에 맞게 글자 크기를 줄여 본다 (17sp → 11sp)
+        var size = sp(17f)
+        var layout = buildPanelLayout(size, innerW)
+        while (layout.height + pad * 2 > maxH && size > sp(11f)) {
+            size -= sp(1f)
+            layout = buildPanelLayout(size, innerW)
+        }
+        val panelH = layout.height + pad * 2
+
+        val below = when (panelPos) {
+            1 -> false
+            2 -> true
+            else -> spaceBelow >= panelH || spaceBelow >= spaceAbove
+        }
+        var top = if (below) r.bottom + gap else r.top - gap - panelH
+        top = top.coerceIn(0f, max(0f, screenH - panelH))
+        var left = r.exactCenterX() - panelW / 2
+        left = left.coerceIn(dp(8f), max(dp(8f), screenW - panelW - dp(8f)))
+
+        val box = RectF(left, top, left + panelW, top + panelH)
+        canvas.drawRoundRect(box, dp(10f), dp(10f), panelBg)
+        canvas.save()
+        canvas.translate(box.left + pad, box.top + pad)
+        layout.draw(canvas)
+        canvas.restore()
+    }
+
+    private fun buildPanelLayout(size: Float, width: Int): StaticLayout {
+        val sb = android.text.SpannableStringBuilder()
+        panelLines.forEachIndexed { i, (jp, ko) ->
+            if (i > 0) sb.append("\n")
+            if (showOriginal) {
+                val s = sb.length
+                sb.append(jp).append("\n")
+                sb.setSpan(android.text.style.AbsoluteSizeSpan((size * 0.72f).toInt()), s, sb.length, 0)
+                sb.setSpan(android.text.style.ForegroundColorSpan(Color.rgb(170, 170, 178)), s, sb.length, 0)
+            }
+            sb.append(ko)
+        }
+        panelText.textSize = size
+        return StaticLayout.Builder.obtain(sb, 0, sb.length, panelText, max(1, width))
+            .setAlignment(Layout.Alignment.ALIGN_NORMAL)
+            .setLineSpacing(dp(2f), 1.0f)
+            .setIncludePad(false)
+            .build()
     }
 
     // ---------------------------------------------------------------- 가로

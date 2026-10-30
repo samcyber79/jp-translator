@@ -17,7 +17,7 @@ import kotlin.math.abs
 /**
  * 화면 위에 떠 있는 동그란 번역 버튼.
  * - 탭: 지금 화면 번역 / 번역 지우기
- * - 길게 누르기: 실시간 모드 켜기·끄기
+ * - 길게 누르기: 메뉴 (영역 지정, 실시간 등)
  * - 드래그: 위치 이동 (놓으면 가까운 가장자리로 붙음)
  */
 @SuppressLint("ViewConstructor")
@@ -67,6 +67,28 @@ class BubbleController(
 
     fun setBusy(busy: Boolean) { view.busy = busy; view.invalidate() }
     fun setLive(live: Boolean) { view.live = live; view.invalidate() }
+    fun setRegionMode(on: Boolean) { view.region = on; view.invalidate() }
+
+    /** 버튼이 [r](번역 영역)과 겹치면 영역 바깥 가장 가까운 곳으로 옮긴다 */
+    fun moveOutOf(r: Rect) {
+        val b = wm.maximumWindowMetrics.bounds
+        val margin = (12 * density).toInt()
+        val cur = Rect(params.x, params.y, params.x + size, params.y + size)
+        if (!Rect.intersects(cur, Rect(r.left - margin, r.top - margin, r.right + margin, r.bottom + margin))) return
+        // 위/아래/왼쪽/오른쪽 후보 중 화면 안에 들어가고 가장 적게 움직이는 곳
+        val candidates = listOf(
+            params.x to r.top - margin - size,
+            params.x to r.bottom + margin,
+            r.left - margin - size to params.y,
+            r.right + margin to params.y,
+        ).filter { (x, y) -> x >= 0 && y >= 0 && x + size <= b.width() && y + size <= b.height() }
+        val best = candidates.minByOrNull { (x, y) -> Math.abs(x - params.x) + Math.abs(y - params.y) }
+            ?: (b.width() - size - margin to margin)
+        params.x = best.first
+        params.y = best.second
+        try { wm.updateViewLayout(view, params) } catch (_: Exception) { }
+        view.post { updateRect() }
+    }
 
     /** 회전 후 화면 밖으로 나가지 않게 */
     fun clampToScreen() {
@@ -145,10 +167,11 @@ class BubbleController(
         }
     }
 
-    /** 원형 버튼 그리기: 기본=짙은 원 + "訳", 실시간=초록 테두리, 처리 중=흐리게 */
+    /** 원형 버튼 그리기: 기본=빨간 테두리, 실시간=초록 테두리, 영역 모드=노란 테두리, 처리 중=흐리게 */
     private class BubbleView(context: Context) : View(context) {
         var live = false
         var busy = false
+        var region = false
         private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.argb(225, 30, 30, 34) }
         private val ring = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             style = Paint.Style.STROKE
@@ -166,7 +189,11 @@ class BubbleController(
             val r = width / 2f - ring.strokeWidth
             fill.alpha = if (busy) 140 else 225
             canvas.drawCircle(cx, cy, r, fill)
-            ring.color = if (live) Color.rgb(60, 200, 110) else Color.rgb(224, 83, 61)
+            ring.color = when {
+                region -> Color.rgb(255, 196, 0)
+                live -> Color.rgb(60, 200, 110)
+                else -> Color.rgb(224, 83, 61)
+            }
             canvas.drawCircle(cx, cy, r, ring)
             text.textSize = width * 0.38f
             val label = if (busy) "…" else "訳"
